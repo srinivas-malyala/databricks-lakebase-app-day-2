@@ -520,7 +520,7 @@ print("\nRun sql/02_setup_embeddings_table.sql in your Lakebase database before 
 
 # COMMAND ----------
 
-# DBTITLE 1,Insert embeddings using psycopg2
+# DBTITLE 1,Insert embeddings in batches with pg8000 and conflict h ...
 import pg8000.native
 from pyspark.sql.functions import current_timestamp, lit
 
