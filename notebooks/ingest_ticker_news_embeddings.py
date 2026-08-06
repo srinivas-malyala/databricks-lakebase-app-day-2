@@ -1,4 +1,8 @@
 # Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "5"
+# ///
 # MAGIC %md
 # MAGIC # Ingest Ticker News -> Vector Embeddings (Lakebase)
 # MAGIC
@@ -31,7 +35,7 @@
 # COMMAND ----------
 
 # DBTITLE 1,Install all required packages
-# MAGIC %pip install -q psycopg2-binary sentence-transformers trafilatura requests
+# MAGIC %pip install -q pg8000 sentence-transformers trafilatura requests
 
 # COMMAND ----------
 
@@ -324,66 +328,82 @@ print(f"Run the next cell to insert them using executeLakebasePostgresSql tool."
 
 # COMMAND ----------
 
-# DBTITLE 1,Insert collected news articles using psycopg2
-import psycopg2
-from psycopg2.extras import execute_values
+# DBTITLE 1,Insert collected news articles using Lakebase SDK
+import pg8000.native
 
 print(f"Inserting {len(all_news_rows)} news articles into {NEWS_TABLE_NAME}...")
 
-# Build connection from parsed URL
-conn = psycopg2.connect(
-    host=db_host,
-    port=parsed.port or 5432,
-    dbname=db_name,
-    user=parsed.username,
-    password=parsed.password,
-    sslmode='require'
-)
-
-try:
-    cursor = conn.cursor()
+if len(all_news_rows) == 0:
+    print("No news articles to insert.")
+else:
+    conn = pg8000.native.Connection(
+        host=db_host,
+        port=parsed.port or 5432,
+        database=db_name,
+        user=parsed.username,
+        password=parsed.password,
+        ssl_context=True  # equivalent to sslmode='require'
+    )
     
-    # Prepare data tuples for batch insert
-    insert_data = [
-        (
-            row['id'],
-            row['ticker'],
-            row['title'],
-            row['description'],
-            row['author'],
-            row['article_url'],
-            row['publisher_name'],
-            row['keywords'],
-            row['sentiment'],
-            row['sentiment_reasoning'],
-            row['published_utc'],
-            row['payload']
-        )
-        for row in all_news_rows
-    ]
-    
-    # Batch insert with ON CONFLICT DO NOTHING for deduplication
-    insert_sql = f"""
-        INSERT INTO {NEWS_TABLE_NAME} (
-            id, ticker, title, description, author, article_url, publisher_name,
-            keywords, sentiment, sentiment_reasoning, published_utc, payload, synced_at
-        ) VALUES %s
-        ON CONFLICT (id) DO NOTHING
-    """
-    
-    # execute_values is much faster than individual INSERTs
-    # Add CURRENT_TIMESTAMP for synced_at column
-    template = "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)"
-    execute_values(cursor, insert_sql, insert_data, template=template, page_size=100)
-    
-    conn.commit()
-    inserted_count = cursor.rowcount
-    print(f"✅ Successfully inserted {inserted_count} new news articles")
-    print(f"   (Duplicates were skipped via ON CONFLICT DO NOTHING)")
-    
-finally:
-    cursor.close()
-    conn.close()
+    try:
+        # Insert in batches to avoid query size limits
+        batch_size = 50
+        total_inserted = 0
+        
+        for i in range(0, len(all_news_rows), batch_size):
+            batch = all_news_rows[i:i + batch_size]
+            
+            # Build parameterized VALUES clauses using pg8000's :param syntax
+            values_list = []
+            for j, row in enumerate(batch):
+                # pg8000.native uses :param_name syntax with a dict of all params
+                base_idx = j * 12  # 12 fields per row (added payload)
+                values_list.append(
+                    f"(:p{base_idx}, :p{base_idx+1}, :p{base_idx+2}, :p{base_idx+3}, "
+                    f":p{base_idx+4}, :p{base_idx+5}, :p{base_idx+6}, :p{base_idx+7}, "
+                    f":p{base_idx+8}, :p{base_idx+9}, :p{base_idx+10}, :p{base_idx+11}, CURRENT_TIMESTAMP)"
+                )
+            
+            # Build param dict with all values
+            params = {}
+            for j, row in enumerate(batch):
+                base_idx = j * 12
+                params[f'p{base_idx}'] = row['id']
+                params[f'p{base_idx+1}'] = row['ticker']
+                params[f'p{base_idx+2}'] = row['title']
+                params[f'p{base_idx+3}'] = row['description']
+                params[f'p{base_idx+4}'] = row['author']
+                params[f'p{base_idx+5}'] = row['article_url']
+                params[f'p{base_idx+6}'] = row['publisher_name']
+                params[f'p{base_idx+7}'] = row['keywords']
+                params[f'p{base_idx+8}'] = row['sentiment']
+                params[f'p{base_idx+9}'] = row['sentiment_reasoning']
+                params[f'p{base_idx+10}'] = row['published_utc']
+                params[f'p{base_idx+11}'] = row['payload']
+            
+            insert_sql = f"""
+                INSERT INTO {NEWS_TABLE_NAME} (
+                    id, ticker, title, description, author, article_url, publisher_name,
+                    keywords, sentiment, sentiment_reasoning, published_utc, payload, synced_at
+                ) VALUES {', '.join(values_list)}
+                ON CONFLICT (id) DO NOTHING
+            """
+            
+            conn.run(insert_sql, **params)
+            total_inserted += len(batch)
+            print(f"  Batch {i//batch_size + 1}: Inserted {len(batch)} articles")
+        
+        conn.close()
+        print(f"\n✅ Successfully processed {total_inserted} news articles")
+        print(f"   (Duplicates were skipped via ON CONFLICT DO NOTHING)")
+        
+    except Exception as e:
+        print(f"❌ Error inserting news articles: {e}")
+        import traceback
+        traceback.print_exc()
+        if conn:
+            conn.close()
+        raise
 
 print(f"\nReady to compute embeddings! Run the cells below to continue.")
 
@@ -501,8 +521,7 @@ print("\nRun sql/02_setup_embeddings_table.sql in your Lakebase database before 
 # COMMAND ----------
 
 # DBTITLE 1,Insert embeddings using psycopg2
-import psycopg2
-from psycopg2.extras import execute_values
+import pg8000.native
 from pyspark.sql.functions import current_timestamp, lit
 
 # Add model_name and embedded_at columns
@@ -510,62 +529,76 @@ embeddings_with_meta = embeddings_df.withColumn("model_name", lit(EMBEDDING_MODE
     "embedded_at", current_timestamp()
 )
 
-# Collect embeddings to driver for psycopg2 batch insert
+# Collect embeddings to driver for pg8000 batch insert
 embeddings_rows = embeddings_with_meta.collect()
 
 if len(embeddings_rows) > 0:
     print(f"Inserting {len(embeddings_rows)} embeddings into {EMBEDDINGS_TABLE_NAME}...")
     
     # Build connection from parsed URL
-    conn = psycopg2.connect(
+    conn = pg8000.native.Connection(
         host=db_host,
         port=parsed.port or 5432,
-        dbname=db_name,
+        database=db_name,
         user=parsed.username,
         password=parsed.password,
-        sslmode='require'
+        ssl_context=True  # equivalent to sslmode='require'
     )
     
     try:
-        cursor = conn.cursor()
+        # Insert in batches to avoid query size limits
+        batch_size = 50
+        total_inserted = 0
         
-        # Prepare data tuples for batch insert
-        # Format embedding as PostgreSQL array literal: '{val1,val2,...}'
-        insert_data = [
-            (
-                row.id,
-                row.ticker,
-                row.title,
-                str(row.published_utc) if row.published_utc else None,
-                '{' + ','.join(str(float(x)) for x in row.embedding) + '}',
-                row.model_name,
-                row.embedded_at
-            )
-            for row in embeddings_rows
-        ]
+        for i in range(0, len(embeddings_rows), batch_size):
+            batch = embeddings_rows[i:i + batch_size]
+            
+            # Build parameterized VALUES clauses using pg8000's :param syntax
+            values_list = []
+            for j, row in enumerate(batch):
+                base_idx = j * 7  # 7 fields per row
+                values_list.append(
+                    f"(:p{base_idx}, :p{base_idx+1}, :p{base_idx+2}, :p{base_idx+3}, "
+                    f":p{base_idx+4}::double precision[], :p{base_idx+5}, :p{base_idx+6})"
+                )
+            
+            # Build param dict with all values
+            params = {}
+            for j, row in enumerate(batch):
+                base_idx = j * 7
+                params[f'p{base_idx}'] = row.id
+                params[f'p{base_idx+1}'] = row.ticker
+                params[f'p{base_idx+2}'] = row.title
+                params[f'p{base_idx+3}'] = str(row.published_utc) if row.published_utc else None
+                # Format embedding as PostgreSQL array literal: '{val1,val2,...}'
+                params[f'p{base_idx+4}'] = '{' + ','.join(str(float(x)) for x in row.embedding) + '}'
+                params[f'p{base_idx+5}'] = row.model_name
+                params[f'p{base_idx+6}'] = row.embedded_at
+            
+            insert_sql = f"""
+                INSERT INTO {EMBEDDINGS_TABLE_NAME} (
+                    id, ticker, title, published_utc, embedding, model_name, embedded_at
+                ) VALUES {', '.join(values_list)}
+                ON CONFLICT (id) DO NOTHING
+            """
+            
+            conn.run(insert_sql, **params)
+            total_inserted += len(batch)
+            print(f"  Batch {i//batch_size + 1}: Inserted {len(batch)} embeddings")
         
-        # Batch insert with ON CONFLICT DO NOTHING for deduplication
-        insert_sql = f"""
-            INSERT INTO {EMBEDDINGS_TABLE_NAME} (
-                id, ticker, title, published_utc, embedding, model_name, embedded_at
-            ) VALUES %s
-            ON CONFLICT (id) DO NOTHING
-        """
-        
-        # execute_values is much faster than individual INSERTs
-        template = "(%s, %s, %s, %s, %s::double precision[], %s, %s)"
-        execute_values(cursor, insert_sql, insert_data, template=template, page_size=100)
-        
-        conn.commit()
-        inserted_count = cursor.rowcount
-        print(f"✅ Successfully inserted {inserted_count} new embeddings")
+        conn.close()
+        print(f"\n✅ Successfully processed {total_inserted} embeddings")
         print(f"   (Duplicates were skipped via ON CONFLICT DO NOTHING)")
         print("\nIMPORTANT: Run this SQL in your Lakebase database to cast arrays to vectors:")
         print(f"  UPDATE {EMBEDDINGS_TABLE_NAME} SET embedding = embedding::vector WHERE embedding IS NOT NULL;")
         
-    finally:
-        cursor.close()
-        conn.close()
+    except Exception as e:
+        print(f"❌ Error inserting embeddings: {e}")
+        import traceback
+        traceback.print_exc()
+        if conn:
+            conn.close()
+        raise
 else:
     print("No embeddings to write.")
 
@@ -720,8 +753,7 @@ print("\nRun sql/03_setup_chunk_embeddings_table.sql in your Lakebase database b
 # COMMAND ----------
 
 # DBTITLE 1,Insert chunk embeddings using psycopg2
-import psycopg2
-from psycopg2.extras import execute_values
+import pg8000.native
 from pyspark.sql.functions import col, current_timestamp, expr, lit
 
 # Add id (article_id_chunk_index), model_name, and embedded_at columns
@@ -734,62 +766,76 @@ chunk_embeddings_with_meta = (
     .withColumn("chunk_index", col("chunk_index").cast("int"))
 )
 
-# Collect chunk embeddings to driver for psycopg2 batch insert
+# Collect chunk embeddings to driver for pg8000 batch insert
 chunk_embeddings_rows = chunk_embeddings_with_meta.collect()
 
 if len(chunk_embeddings_rows) > 0:
     print(f"Inserting {len(chunk_embeddings_rows)} chunk embeddings into {CHUNK_EMBEDDINGS_TABLE_NAME}...")
     
     # Build connection from parsed URL
-    conn = psycopg2.connect(
+    conn = pg8000.native.Connection(
         host=db_host,
         port=parsed.port or 5432,
-        dbname=db_name,
+        database=db_name,
         user=parsed.username,
         password=parsed.password,
-        sslmode='require'
+        ssl_context=True  # equivalent to sslmode='require'
     )
     
     try:
-        cursor = conn.cursor()
+        # Insert in batches to avoid query size limits
+        batch_size = 50
+        total_inserted = 0
         
-        # Prepare data tuples for batch insert
-        # Format embedding as PostgreSQL array literal: '{val1,val2,...}'
-        insert_data = [
-            (
-                row.id,
-                row.article_id,
-                row.ticker,
-                int(row.chunk_index),
-                row.chunk_text,
-                '{' + ','.join(str(float(x)) for x in row.embedding) + '}',
-                row.model_name,
-                row.embedded_at
-            )
-            for row in chunk_embeddings_rows
-        ]
+        for i in range(0, len(chunk_embeddings_rows), batch_size):
+            batch = chunk_embeddings_rows[i:i + batch_size]
+            
+            # Build parameterized VALUES clauses using pg8000's :param syntax
+            values_list = []
+            for j, row in enumerate(batch):
+                base_idx = j * 8  # 8 fields per row
+                values_list.append(
+                    f"(:p{base_idx}, :p{base_idx+1}, :p{base_idx+2}, :p{base_idx+3}, "
+                    f":p{base_idx+4}, :p{base_idx+5}::double precision[], :p{base_idx+6}, :p{base_idx+7})"
+                )
+            
+            # Build param dict with all values
+            params = {}
+            for j, row in enumerate(batch):
+                base_idx = j * 8
+                params[f'p{base_idx}'] = row.id
+                params[f'p{base_idx+1}'] = row.article_id
+                params[f'p{base_idx+2}'] = row.ticker
+                params[f'p{base_idx+3}'] = int(row.chunk_index)
+                params[f'p{base_idx+4}'] = row.chunk_text
+                # Format embedding as PostgreSQL array literal: '{val1,val2,...}'
+                params[f'p{base_idx+5}'] = '{' + ','.join(str(float(x)) for x in row.embedding) + '}'
+                params[f'p{base_idx+6}'] = row.model_name
+                params[f'p{base_idx+7}'] = row.embedded_at
+            
+            insert_sql = f"""
+                INSERT INTO {CHUNK_EMBEDDINGS_TABLE_NAME} (
+                    id, article_id, ticker, chunk_index, chunk_text, embedding, model_name, embedded_at
+                ) VALUES {', '.join(values_list)}
+                ON CONFLICT (id) DO NOTHING
+            """
+            
+            conn.run(insert_sql, **params)
+            total_inserted += len(batch)
+            print(f"  Batch {i//batch_size + 1}: Inserted {len(batch)} chunk embeddings")
         
-        # Batch insert with ON CONFLICT DO NOTHING for deduplication
-        insert_sql = f"""
-            INSERT INTO {CHUNK_EMBEDDINGS_TABLE_NAME} (
-                id, article_id, ticker, chunk_index, chunk_text, embedding, model_name, embedded_at
-            ) VALUES %s
-            ON CONFLICT (id) DO NOTHING
-        """
-        
-        # execute_values is much faster than individual INSERTs
-        template = "(%s, %s, %s, %s, %s, %s::double precision[], %s, %s)"
-        execute_values(cursor, insert_sql, insert_data, template=template, page_size=100)
-        
-        conn.commit()
-        inserted_count = cursor.rowcount
-        print(f"✅ Successfully inserted {inserted_count} new chunk embeddings")
+        conn.close()
+        print(f"\n✅ Successfully processed {total_inserted} chunk embeddings")
         print(f"   (Duplicates were skipped via ON CONFLICT DO NOTHING)")
         print("\nIMPORTANT: Run this SQL in your Lakebase database to cast arrays to vectors:")
         print(f"  UPDATE {CHUNK_EMBEDDINGS_TABLE_NAME} SET embedding = embedding::vector WHERE embedding IS NOT NULL;")
         
-    finally:
-        cursor.close()
-        conn.close()
+    except Exception as e:
+        print(f"❌ Error inserting chunk embeddings: {e}")
+        import traceback
+        traceback.print_exc()
+        if conn:
+            conn.close()
+        raise
 else:
     print("No chunk embeddings to write.")
